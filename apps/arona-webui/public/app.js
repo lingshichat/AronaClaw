@@ -1,5 +1,7 @@
 import { GatewayClient, fetchGatewayAuthConfig } from "./gateway-client.js?v=20260304-chat-streamsmooth-v10";
 
+const THINKING_PLACEHOLDER_TEXT = "思考中...";
+
 const state = {
   currentView: "overview",
   modelsHash: "",
@@ -57,7 +59,9 @@ const state = {
     historyBatchSize: 10,
     historyMaxLimit: 1000,
     hasOlderMessages: false,
-    loadingOlderMessages: false
+    loadingOlderMessages: false,
+    structuredRefreshTimer: null,
+    pendingStructuredMessageIds: new Set()
   }
 };
 
@@ -2719,7 +2723,7 @@ function syncMessageTextSegment(message) {
 }
 
 function mergeStreamingText(currentText, incomingText) {
-  const current = String(currentText || "") === "思考中..." ? "" : String(currentText || "");
+  const current = String(currentText || "") === THINKING_PLACEHOLDER_TEXT ? "" : String(currentText || "");
   const incoming = String(incomingText || "");
 
   if (!incoming) return current;
@@ -2759,6 +2763,40 @@ function clearChatDeltaFlushScheduler() {
 
   state.chat.deltaFlushTimer = null;
   state.chat.deltaFlushIsRaf = false;
+}
+
+function clearChatStructuredRefreshScheduler() {
+  if (state.chat.structuredRefreshTimer) {
+    clearTimeout(state.chat.structuredRefreshTimer);
+  }
+  state.chat.structuredRefreshTimer = null;
+  if (state.chat.pendingStructuredMessageIds instanceof Set) {
+    state.chat.pendingStructuredMessageIds.clear();
+  }
+}
+
+function scheduleChatStructuredRefresh(messageId) {
+  const id = String(messageId || "").trim();
+  if (!id) return;
+  if (!(state.chat.pendingStructuredMessageIds instanceof Set)) {
+    state.chat.pendingStructuredMessageIds = new Set();
+  }
+  state.chat.pendingStructuredMessageIds.add(id);
+  if (state.chat.structuredRefreshTimer) return;
+
+  // Batch expensive full-row updates so thinking/tool segments don't thrash layout.
+  const pendingCount = state.chat.pendingStructuredMessageIds.size;
+  const delayMs = Math.max(32, Math.min(80, 40 + pendingCount * 8));
+  state.chat.structuredRefreshTimer = setTimeout(() => {
+    state.chat.structuredRefreshTimer = null;
+    const ids = Array.from(state.chat.pendingStructuredMessageIds || []);
+    state.chat.pendingStructuredMessageIds.clear();
+    if (ids.length === 0) return;
+    const updated = updateChatMessageRows(ids, { scrollOnUpdate: false, forceFull: true });
+    if (!updated) {
+      renderChatMessages({ autoScroll: false });
+    }
+  }, delayMs);
 }
 
 function scheduleChatDeltaFlushScheduler() {
@@ -2803,23 +2841,33 @@ function clearChatStreamAnimationScheduler({ clearTargets = true } = {}) {
 }
 
 function advanceStreamDisplayText(currentText, targetText, charBudget) {
-  const current = String(currentText || "") === "思考中..." ? "" : String(currentText || "");
+  const current = String(currentText || "") === THINKING_PLACEHOLDER_TEXT ? "" : String(currentText || "");
   const target = String(targetText || "");
-  const budget = Math.max(1, Number(charBudget) || 1);
+  const budget = Math.max(4, Number(charBudget) || 12);
 
   if (!target) return current;
   if (current === target) return current;
-  if (!current) return target.slice(0, budget);
+  if (current.startsWith(target)) return target;
+  if (!target.startsWith(current)) return target;
 
-  if (target.startsWith(current)) {
-    return `${current}${target.slice(current.length, current.length + budget)}`;
+  const start = current.length;
+  const hardEnd = Math.min(target.length, start + budget);
+  let end = hardEnd;
+
+  // Prefer chunk boundaries so streaming feels like semantic blocks, not a typewriter.
+  const boundaryChars = new Set([" ", "\n", "\t", ",", "，", ".", "。", "!", "！", "?", "？", ";", "；", ":", "："]);
+  const lookaheadEnd = Math.min(target.length, hardEnd + 10);
+  for (let i = hardEnd; i < lookaheadEnd; i += 1) {
+    if (boundaryChars.has(target[i])) {
+      end = i + 1;
+      break;
+    }
   }
 
-  if (current.startsWith(target)) {
-    return target;
+  if (end <= start) {
+    end = Math.min(target.length, start + budget);
   }
-
-  return target;
+  return target.slice(0, end);
 }
 
 function scheduleChatStreamAnimation() {
@@ -3799,6 +3847,7 @@ async function ensureChatClientConnected() {
       setChatStatus(info.status, info);
       if (info.status === "disconnected") {
         clearChatDeltaFlushScheduler();
+        clearChatStructuredRefreshScheduler();
         state.chat.pendingDeltaByRun.clear();
         clearChatStreamAnimationScheduler();
       }
@@ -3826,11 +3875,13 @@ async function ensureChatClientConnected() {
       }
 
       if (runId && state.chat.pendingRuns.has(runId)) {
+        const reasoningText = typeof payload.reasoning === "string" ? payload.reasoning : "";
+        const reasoningDeltaText = typeof payload.reasoningDelta === "string" ? payload.reasoningDelta : "";
         const eventSegments = [
           ...extractEventMessageSegments(payload.message),
           ...extractEventMessageSegments(payload.thinking),
-          ...extractEventMessageSegments(payload.reasoning),
-          ...extractEventMessageSegments(payload.reasoningDelta)
+          ...(reasoningText ? [{ type: "thinking", text: reasoningText }] : []),
+          ...(reasoningDeltaText ? [{ type: "thinking", text: reasoningDeltaText }] : [])
         ];
         let structuredChanged = false;
         const pendingMessageId = String(state.chat.pendingRuns.get(runId) || "").trim();
@@ -3865,11 +3916,19 @@ async function ensureChatClientConnected() {
 
           if (eventState === "final") {
             const finalText = joinTextFromSegments(eventSegments) || extractEventMessageText(payload.message, { trim: true });
-            if (finalText) message.text = finalText;
             if (eventSegments.length > 0) {
-              message.segments = eventSegments;
+              mergeStructuredSegmentsIntoMessage(message, eventSegments);
             }
-            syncMessageTextSegment(message);
+            const hasThinkingEvent = eventSegments.some((segment) => segment?.type === "thinking");
+            if (!hasThinkingEvent && Array.isArray(message.segments)) {
+              message.segments = message.segments.filter(
+                (segment) => !(segment?.type === "thinking" && String(segment.text || "") === THINKING_PLACEHOLDER_TEXT)
+              );
+            }
+            if (finalText) {
+              message.text = finalText;
+              syncMessageTextSegment(message);
+            }
             message.pending = false;
             state.chat.streamTargetByMessage.delete(message.id);
           }
@@ -3885,10 +3944,7 @@ async function ensureChatClientConnected() {
         if (eventState !== "delta") {
           renderChatMessages();
         } else if (structuredChanged && pendingMessageId) {
-          const updated = updateChatMessageRows([pendingMessageId], { scrollOnUpdate: false, forceFull: true });
-          if (!updated) {
-            renderChatMessages({ autoScroll: false });
-          }
+          scheduleChatStructuredRefresh(pendingMessageId);
         }
       }
 
@@ -4109,8 +4165,12 @@ async function sendChatMessage(text) {
   const pendingAssistant = {
     id: `local-assistant-${Date.now()}`,
     role: "assistant",
-    text: "思考中...",
-    segments: [{ type: "text", text: "思考中..." }],
+    text: THINKING_PLACEHOLDER_TEXT,
+    // Pre-render a thinking placeholder so late upstream reasoning still feels continuous.
+    segments: [
+      { type: "thinking", text: THINKING_PLACEHOLDER_TEXT },
+      { type: "text", text: THINKING_PLACEHOLDER_TEXT }
+    ],
     ts: Date.now(),
     pending: true
   };
