@@ -1002,6 +1002,8 @@ export const chatHandlers: GatewayRequestHandlers = {
             }
           },
           onModelSelected,
+          // Presence of this callback enables reasoning stream emission for webchat runs.
+          onReasoningStream: async () => {},
         },
       })
         .then(() => {
