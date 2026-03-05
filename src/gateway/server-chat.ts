@@ -339,6 +339,28 @@ export function createAgentEventHandler({
     nodeSendToSession(sessionKey, "chat", payload);
   };
 
+  const emitChatReasoningDelta = (
+    sessionKey: string,
+    clientRunId: string,
+    seq: number,
+    reasoning: string,
+    reasoningDelta: string,
+  ) => {
+    if (!reasoning && !reasoningDelta) {
+      return;
+    }
+    const payload = {
+      runId: clientRunId,
+      sessionKey,
+      seq,
+      state: "delta" as const,
+      reasoning,
+      reasoningDelta,
+    };
+    broadcast("chat", payload, { dropIfSlow: true });
+    nodeSendToSession(sessionKey, "chat", payload);
+  };
+
   const emitChatFinal = (
     sessionKey: string,
     clientRunId: string,
@@ -513,6 +535,10 @@ export function createAgentEventHandler({
       }
       if (!isAborted && evt.stream === "assistant" && typeof evt.data?.text === "string") {
         emitChatDelta(sessionKey, clientRunId, evt.runId, evt.seq, evt.data.text);
+      } else if (!isAborted && evt.stream === "thinking") {
+        const text = typeof evt.data?.text === "string" ? evt.data.text : "";
+        const delta = typeof evt.data?.delta === "string" ? evt.data.delta : "";
+        emitChatReasoningDelta(sessionKey, clientRunId, evt.seq, text, delta);
       } else if (!isAborted && (lifecyclePhase === "end" || lifecyclePhase === "error")) {
         const evtStopReason =
           typeof evt.data?.stopReason === "string" ? evt.data.stopReason : undefined;
