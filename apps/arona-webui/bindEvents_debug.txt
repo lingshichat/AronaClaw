@@ -1,0 +1,1726 @@
+const state = {
+  currentView: "overview",
+  modelsHash: "",
+  modelProviderSnapshots: {},
+  providerModalOpen: false,
+  logsCursor: null,
+  logsTimer: null,
+  logsLive: false,
+  systemTimer: null,
+  overviewTimer: null,
+  nodeCommandDefaults: [],
+  modelDefaultOptions: [],
+  cronJsonMode: false
+};
+
+// =========================================
+// Spotlight 交互与全局光照
+// =========================================
+document.addEventListener("mousemove", (e) => {
+  const spotlights = document.querySelectorAll("[data-spotlight]");
+  for (const el of spotlights) {
+    const rect = el.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    let lens = el.querySelector(".spotlight-lens");
+    if (!lens) {
+      lens = document.createElement("div");
+      lens.className = "spotlight-lens";
+      el.appendChild(lens);
+    }
+    lens.style.background = `radial-gradient(circle at ${x}px ${y}px, rgba(255, 255, 255, 0.08) 0%, transparent 60%)`;
+  }
+});
+
+const viewLoaders = {
+  overview: loadOverview,
+  models: loadModels,
+  skills: loadSkills,
+  cron: loadCron,
+  nodes: loadNodes,
+  logs: initLogsView
+};
+
+function $(id) {
+  return document.getElementById(id);
+}
+
+async function api(path, options = {}) {
+  const token = localStorage.getItem("openclaw_token");
+  const mergedHeaders = {
+    "Content-Type": "application/json",
+    ...(options.headers || {})
+  };
+  if (token) {
+    mergedHeaders["Authorization"] = `Bearer ${token}`;
+  }
+  const res = await fetch(path, {
+    ...options,
+    headers: mergedHeaders
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401) {
+    localStorage.removeItem("openclaw_token");
+    window.location.href = "/login.html";
+    return;
+  }
+  if (!res.ok || data.ok === false) {
+    throw new Error(data.error || `request failed (${res.status})`);
+  }
+  return data;
+}
+
+
+// Blog Admin Toast Implementation
+function showToast(message, type = 'info', duration = 3000) {
+  const container = document.getElementById('toast-container');
+  if (!container) return;
+
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+
+  let iconClass = 'fa-solid fa-circle-info';
+  let title = '系统通知';
+
+  if (type === 'success') {
+    iconClass = 'fa-solid fa-check';
+    title = '操作成功';
+  } else if (type === 'error') {
+    iconClass = 'fa-solid fa-xmark';
+    title = '操作失败';
+  } else if (type === 'warning') {
+    iconClass = 'fa-solid fa-exclamation';
+    title = '警告';
+  }
+
+  toast.innerHTML = `
+      <div class="toast-icon">
+          <i class="${iconClass}"></i>
+      </div>
+      <div class="toast-content">
+          <div class="toast-title">${title}</div>
+          <div class="toast-message">${escapeHtml(message)}</div>
+      </div>
+      <button class="toast-close"><i class="fa-solid fa-xmark"></i></button>
+  `;
+
+  container.appendChild(toast);
+
+  // Close button event
+  const closeBtn = toast.querySelector('.toast-close');
+  closeBtn.addEventListener('click', () => {
+    removeToast(toast);
+  });
+
+  // Auto remove
+  if (duration > 0) {
+    setTimeout(() => {
+      removeToast(toast);
+    }, duration);
+  }
+}
+
+function removeToast(toast) {
+  if (toast.classList.contains('toast-exit')) return;
+  toast.classList.add('toast-exit');
+  toast.addEventListener('animationend', () => {
+    toast.remove();
+  });
+}
+
+function showError(targetId, err) {
+  const el = $(targetId);
+  if (!el) return;
+  el.textContent = `Error: ${err instanceof Error ? err.message : String(err)}`;
+}
+
+function renderTable(columns, rows) {
+  const thCells = columns
+    .map((c) => {
+      const cls = c.className ? ` class="${c.className}"` : "";
+      const align = c.align ? ` style="text-align:${c.align};"` : "";
+      return `<th${cls}${align}>${c.title}</th>`;
+    })
+    .join("");
+
+  const trRows = rows
+    .map((row) => {
+      const tdCells = columns
+        .map((c) => {
+          const cls = c.className ? ` class="${c.className}"` : "";
+          const align = c.align ? ` style="text-align:${c.align};"` : "";
+          return `<td${cls}${align}>${c.render(row)}</td>`;
+        })
+        .join("");
+      return `<tr>${tdCells}</tr>`;
+    })
+    .join("");
+
+  return `<div class="table-wrap"><table><thead><tr>${thCells}</tr></thead><tbody>${trRows}</tbody></table></div>`;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function getLogLevel(line) {
+  const text = String(line || "");
+  if (/\b(error|failed|failure|exception|fatal|panic|denied)\b/i.test(text)) return "error";
+  if (/\b(warn|warning|deprecated|retry)\b/i.test(text)) return "warn";
+  if (/\b(info|connected|started|success|ready)\b/i.test(text)) return "info";
+  return "default";
+}
+
+function highlightLogKeyword(line, keyword) {
+  const source = String(line || "");
+  if (!keyword) return escapeHtml(source);
+  const pattern = new RegExp(escapeRegExp(keyword), "gi");
+  let result = "";
+  let cursor = 0;
+  let match = pattern.exec(source);
+  while (match !== null) {
+    result += escapeHtml(source.slice(cursor, match.index));
+    result += `<mark class="log-highlight">${escapeHtml(match[0])}</mark>`;
+    cursor = match.index + match[0].length;
+    if (match[0].length === 0) break;
+    match = pattern.exec(source);
+  }
+  result += escapeHtml(source.slice(cursor));
+  return result;
+}
+
+function renderLogLine(line, keyword) {
+  const level = getLogLevel(line);
+  return `<span class="log-line log-${level}">${highlightLogKeyword(line, keyword)}</span>`;
+}
+
+function appendLogLines(lines, keyword) {
+  const output = $("logs-output");
+  if (!output || lines.length === 0) return;
+  const html = lines.map((line) => renderLogLine(line, keyword)).join("\n");
+  if (output.innerHTML) output.insertAdjacentText("beforeend", "\n");
+  output.insertAdjacentHTML("beforeend", html);
+  output.scrollTop = output.scrollHeight;
+}
+
+// Safe arithmetic expression evaluator (numbers, + - * /, parentheses, whitespace only)
+function evaluateArithmetic(expr) {
+  const s = String(expr || '').replace(/\s/g, '');
+  if (!s) return 0;
+  if (!/^[0-9+\-*/().]+$/.test(s)) {
+    throw new Error('Invalid expression');
+  }
+  let pos = 0;
+  function parseExpression() {
+    let value = parseTerm();
+    while (pos < s.length) {
+      const char = s[pos];
+      if (char === '+') { pos++; value += parseTerm(); }
+      else if (char === '-') { pos++; value -= parseTerm(); }
+      else break;
+    }
+    return value;
+  }
+  function parseTerm() {
+    let value = parseFactor();
+    while (pos < s.length) {
+      const char = s[pos];
+      if (char === '*') { pos++; value *= parseFactor(); }
+      else if (char === '/') {
+        pos++;
+        const divisor = parseFactor();
+        if (divisor === 0) throw new Error('Division by zero');
+        value /= divisor;
+      } else break;
+    }
+    return value;
+  }
+  function parseFactor() {
+    if (pos >= s.length) throw new Error('Unexpected end');
+    const char = s[pos];
+    if (char === '(') {
+      pos++;
+      const value = parseExpression();
+      if (pos >= s.length || s[pos] !== ')') throw new Error('Missing closing parenthesis');
+      pos++;
+      return value;
+    }
+    const start = pos;
+    let hasDecimal = false;
+    while (pos < s.length) {
+      const c = s[pos];
+      if (c >= '0' && c <= '9') pos++;
+      else if (c === '.' && !hasDecimal) { hasDecimal = true; pos++; }
+      else break;
+    }
+    if (start === pos) throw new Error('Expected number');
+    const num = parseFloat(s.substring(start, pos));
+    if (isNaN(num)) throw new Error('Invalid number');
+    return num;
+  }
+  const result = parseExpression();
+  if (pos < s.length) throw new Error('Unexpected character');
+  return Math.round(result);
+}
+
+function setView(view) {
+  state.currentView = view;
+
+  for (const section of document.querySelectorAll(".view")) {
+    section.classList.toggle("active", section.id === `view-${view}`);
+  }
+
+  for (const item of document.querySelectorAll("#nav-menu .nav-item")) {
+    item.classList.toggle("active", item.dataset.view === view);
+  }
+
+  const load = viewLoaders[view];
+  if (load) load();
+
+  if (view === "overview") {
+    loadSystemLoad();
+    startOverviewTimers();
+  } else {
+    stopOverviewTimers();
+  }
+
+  if (view === "logs") {
+    startLogStream();
+  } else {
+    stopLogStream();
+  }
+}
+
+async function refreshCurrentView() {
+  const load = viewLoaders[state.currentView];
+  if (load) await load();
+}
+
+async function loadHealth() {
+  try {
+    const health = await api("/api/health");
+    const modeRaw = String(health?.gateway?.authMode || "unknown").toLowerCase();
+    const modeMap = {
+      token: "令牌",
+      password: "密码",
+      none: "无",
+      unknown: "未知"
+    };
+    const mode = modeMap[modeRaw] || modeRaw;
+    $("health-pill").textContent = `认证模式：${mode}`;
+  } catch (err) {
+    $("health-pill").textContent = "网关离线";
+    console.error(err);
+  }
+}
+
+function setPerfValue(valueId, percent) {
+  const safePercent = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
+  const valueEl = $(valueId);
+  if (valueEl) valueEl.textContent = `${safePercent.toFixed(1)}%`;
+}
+
+async function loadSystemLoad() {
+  try {
+    const data = await api("/api/system-load");
+    const cpu = data?.system?.cpu || {};
+    const memory = data?.system?.memory || {};
+
+    const cpuPercent = Number.isFinite(cpu.usagePercent) ? cpu.usagePercent : cpu.normalizedLoadPercent || 0;
+    setPerfValue("cpu-value", cpuPercent);
+
+    const memPercent = Number(memory.usagePercent || 0);
+    setPerfValue("mem-value", memPercent);
+  } catch (err) {
+    setPerfValue("cpu-value", 0);
+    setPerfValue("mem-value", 0);
+    console.error(err);
+  }
+}
+
+function startOverviewTimers() {
+  if (!state.systemTimer) {
+    state.systemTimer = setInterval(() => {
+      if (state.currentView === "overview") loadSystemLoad();
+    }, 5000);
+  }
+  if (!state.overviewTimer) {
+    state.overviewTimer = setInterval(() => {
+      if (state.currentView === "overview") loadOverview();
+    }, 30000);
+  }
+}
+
+function stopOverviewTimers() {
+  if (state.systemTimer) {
+    clearInterval(state.systemTimer);
+    state.systemTimer = null;
+  }
+  if (state.overviewTimer) {
+    clearInterval(state.overviewTimer);
+    state.overviewTimer = null;
+  }
+}
+
+function renderEmpty(icon, title, subtitle) {
+  return `
+    <div class="empty-placeholder">
+      <div class="empty-icon"><i class="${icon}"></i></div>
+      <div style="font-size: 1.1rem; color: var(--text-secondary); font-weight: 500;">${title}</div>
+      <div style="font-size: 0.9rem; margin-top: 8px;">${subtitle}</div>
+    </div>
+  `;
+}
+
+function renderSkeleton(rows = 3) {
+  let lines = "";
+  for (let i = 0; i < rows; i++) {
+    lines += `<div class="skeleton-text" style="width: ${80 + Math.random() * 20}%"></div>`;
+  }
+  return `<div style="padding: 20px;">${lines}</div>`;
+}
+
+async function loadOverview() {
+  const container = $("overview-content");
+  container.innerHTML = renderSkeleton(5);
+
+  try {
+    const data = await api("/api/overview");
+    const channels = data.channels?.channels || {};
+    const channelValues = Object.values(channels);
+    if (channelValues.length === 0 && (data.sessions?.sessions || []).length === 0) {
+      container.innerHTML = renderEmpty("fa-solid fa-wind", "暂无活跃数据", "阿洛娜还没发现任何会话或频道记录呢～");
+      return;
+    }
+    const connectedChannels = channelValues.filter((entry) => entry?.connected).length;
+
+    const sessions = data.sessions?.sessions || [];
+    const cronJobs = data.cronList?.jobs || [];
+    const nodeList = data.nodes?.nodes || [];
+    const nodeOnline = nodeList.filter((node) => node.connected).length;
+    const errors = (data.logs?.lines || []).filter((line) => /error|failed|denied/i.test(line));
+
+    const metrics = [
+      { label: "活跃会话", value: sessions.length, icon: "fa-regular fa-comments", color: "#64b5f6" },
+      { label: "计划任务", value: cronJobs.filter((j) => j.enabled).length, icon: "fa-regular fa-clock", color: "#81c784" },
+      { label: "在线节点", value: `${nodeOnline}/${nodeList.length}`, icon: "fa-solid fa-server", color: "#fff176" },
+      { label: "最近异常", value: errors.length, icon: "fa-solid fa-triangle-exclamation", color: "#e57373" }
+    ];
+
+    const statsHtml = metrics.map(m => `
+      <div class="stat-card" style="display: flex; align-items: center; justify-content: flex-start; gap: 16px; padding: 20px 24px;">
+      <div style="width: 48px; height: 48px; border-radius: 14px; background: rgba(128, 128, 128, 0.15); display: flex; align-items: center; justify-content: center;">
+          <i class="${m.icon}" style="color: ${m.color}; font-size: 1.6rem;"></i>
+        </div>
+        <div style="display: flex; flex-direction: column; align-items: flex-start;">
+          <div class="stat-label" style="font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 4px;">${m.label}</div>
+          <div class="stat-value" style="font-size: 1.8rem; font-weight: 600; line-height: 1; color: var(--text-primary);">${m.value}</div>
+        </div>
+      </div>
+    `).join("");
+
+    const sessionsHtml = sessions.slice(0, 10).map((r) => {
+      return `
+        <div style="padding: 12px 16px; border-bottom: 1px solid var(--border-default); display: flex; flex-direction: column; gap: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+            <strong style="word-break: break-all; font-size: 0.95rem; color: var(--foreground); font-weight: 500;">${escapeHtml(r.label || r.displayName || r.key)}</strong>
+            <span style="color: var(--foreground-muted); white-space: nowrap; font-size: 0.8rem;"><i class="fa-regular fa-clock" style="margin-right: 4px;"></i>${r.updatedAt ? new Date(r.updatedAt).toLocaleTimeString() : "-"}</span>
+          </div>
+          <div>
+            <span class="status-badge" style="background: rgba(94, 106, 210, 0.15); border: 1px solid rgba(94, 106, 210, 0.3); color: var(--accent); white-space: nowrap; padding: 4px 10px; border-radius: 6px; font-size: 0.75rem;"><i class="fa-solid fa-microchip" style="margin-right: 6px;"></i>${escapeHtml(r.model || "-")}</span>
+          </div>
+        </div>
+      `;
+    }).join("");
+
+    const channelAccounts = data.channels?.channelAccounts || {};
+    const channelRows = Object.entries(channels).map(([name, ch]) => {
+      const accounts = Array.isArray(channelAccounts[name]) ? channelAccounts[name] : [];
+      const hasConnected = ch?.connected === true || accounts.some((acc) => acc?.connected === true);
+      const hasRunning = ch?.running === true || accounts.some((acc) => acc?.running === true);
+      const configured = ch?.configured === true;
+
+      let stateLabel = "离线";
+      let statusColor = "var(--warning)";
+      let statusBg = "rgba(251, 191, 36, 0.15)";
+      let statusBorder = "rgba(251, 191, 36, 0.3)";
+
+      if (!configured) {
+        stateLabel = "未配置";
+        statusColor = "var(--danger)";
+        statusBg = "rgba(239, 68, 68, 0.15)";
+        statusBorder = "rgba(239, 68, 68, 0.3)";
+      } else if (hasConnected) {
+        stateLabel = "已连接";
+        statusColor = "var(--success)";
+        statusBg = "rgba(16, 185, 129, 0.15)";
+        statusBorder = "rgba(16, 185, 129, 0.3)";
+      } else if (hasRunning) {
+        stateLabel = "运行中";
+        statusColor = "var(--success)";
+        statusBg = "rgba(16, 185, 129, 0.15)";
+        statusBorder = "rgba(16, 185, 129, 0.3)";
+      }
+
+      const detail = ch?.lastError || ch?.mode || (hasRunning ? "服务已启动" : "等待启动");
+      return { name, detail, stateLabel, statusColor, statusBg, statusBorder };
+    });
+
+    const channelHtml = channelRows.map((r) => {
+      return `
+        <div style="padding: 12px 16px; border-bottom: 1px solid var(--border-default); display: flex; flex-direction: column; gap: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <strong style="white-space: nowrap; font-size: 0.95rem; color: var(--foreground); font-weight: 500;">${escapeHtml(r.name)}</strong>
+            <span style="color: ${r.statusColor}; background: ${r.statusBg}; border: 1px solid ${r.statusBorder}; padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">${r.stateLabel}</span>
+          </div>
+          <div>
+            <span style="color: var(--foreground-muted); font-size: 0.85rem; word-break: break-all;">${escapeHtml(r.detail || "-")}</span>
+          </div>
+        </div>
+      `;
+    }).join("");
+
+    container.innerHTML = `
+
+      <div class="dashboard-grid" style="gap: 24px; margin-bottom: 35px;">${statsHtml}</div>
+      
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 24px;">
+        <div class="glass-panel" data-spotlight style="margin-bottom: 0; display: flex; flex-direction: column;">
+          <div class="panel-header" style="border-bottom: 1px solid var(--border-default);"><span class="panel-title" style="color: var(--foreground);"><i class="fa-solid fa-list-ul" style="color: var(--accent); margin-right: 10px;"></i>最近活跃会话</span></div>
+          <div style="flex: 1; overflow-y: auto;">
+             ${sessionsHtml || '<div style="padding: 24px; text-align: center; color: var(--foreground-muted); font-size: 0.9rem;">暂无活跃会话</div>'}
+          </div>
+        </div>
+        
+        <div class="glass-panel" data-spotlight style="margin-bottom: 0; display: flex; flex-direction: column;">
+          <div class="panel-header" style="border-bottom: 1px solid var(--border-default);"><span class="panel-title" style="color: var(--foreground);"><i class="fa-solid fa-network-wired" style="color: var(--warning); margin-right: 10px;"></i>频道状态快照</span></div>
+          <div style="flex: 1; overflow-y: auto;">
+             ${channelHtml || '<div style="padding: 24px; text-align: center; color: var(--foreground-muted); font-size: 0.9rem;">暂无频道数据</div>'}
+          </div>
+        </div>
+      </div>
+    `;
+  } catch (err) {
+    container.innerHTML = `<div class="glass-panel" style="padding: 20px; color: var(--danger)">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+// （别名和默认模型相关控制已被移除）
+
+function cloneProviderConfig(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return {};
+  }
+}
+
+function normalizeProviderEditorData(provider) {
+  const source = provider && typeof provider === "object" && !Array.isArray(provider) ? provider : {};
+  const modelsValue = Object.prototype.hasOwnProperty.call(source, "models") ? source.models : [];
+
+  return {
+    baseUrl:
+      (typeof source.baseUrl === "string" && source.baseUrl) ||
+      (typeof source.baseURL === "string" && source.baseURL) ||
+      (typeof source.url === "string" && source.url) ||
+      "",
+    apiKey: (typeof source.apiKey === "string" && source.apiKey) || "",
+    apiType:
+      (typeof source.apiType === "string" && source.apiType) ||
+      (typeof source.type === "string" && source.type) ||
+      "openai",
+    modelRows: normalizeProviderModels(modelsValue)
+  };
+}
+
+function normalizeProviderModelRow(entry, fallbackId = "") {
+  if (typeof entry === "string") {
+    return {
+      id: entry,
+      contextWindow: "",
+      reasoning: false,
+      input: "",
+      extras: {}
+    };
+  }
+
+  const source = entry && typeof entry === "object" && !Array.isArray(entry) ? cloneProviderConfig(entry) : {};
+  const id =
+    (typeof source.id === "string" && source.id) ||
+    (typeof source.model === "string" && source.model) ||
+    fallbackId ||
+    "";
+
+  let contextWindow = "";
+  if (source.contextWindow !== null && source.contextWindow !== undefined && source.contextWindow !== "") {
+    const parsedWindow = Number(source.contextWindow);
+    if (Number.isFinite(parsedWindow) && parsedWindow > 0) {
+      contextWindow = String(Math.trunc(parsedWindow));
+    }
+  }
+
+  const reasoning = source.reasoning === true;
+  const input = Array.isArray(source.input)
+    ? source.input.map((value) => String(value).trim()).filter(Boolean).join(", ")
+    : "";
+
+  delete source.id;
+  delete source.model;
+  delete source.contextWindow;
+  delete source.reasoning;
+  delete source.input;
+
+  return {
+    id,
+    contextWindow,
+    reasoning,
+    input,
+    extras: source
+  };
+}
+
+// 常用提供商 SVG Icon (来自 simple-icons 白底版本) 及统一默认黑金质感配色
+const DEFAULT_BRAND_COLOR = "#a3a8b4";
+
+const SVG_ICONS = {
+  openai: `<svg width="1em" height="1em" viewBox="0 0 24 24" fill="currentColor"><path d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0462 6.0462 0 0 0 5.45-3.1818 5.9847 5.9847 0 0 0 3.998-2.9 6.0462 6.0462 0 0 0-.426-7.0971zM14.224 22.7508a4.4256 4.4256 0 0 1-2.876-1.04l.1417-.08v-7.625l-2.0916-1.205v-5.91l4.8258 2.7668v13.1118zM6.9234 19.9822a4.4256 4.4256 0 0 1-.5157-3.0248l.1417.08 6.6415 3.823 2.0911 1.205-3.0247 5.234a4.4256 4.4256 0 0 1-5.3339-7.3172zm-4.3228-5.3217a4.4256 4.4256 0 0 1 2.3603-1.9848v7.625l2.0916 1.205 2.8851-4.9975-4.8256-2.7668v-12.193a4.4256 4.4256 0 0 1-2.5114 13.1121zm1.7513-10.02a4.4256 4.4256 0 0 1 2.876 1.04l-.1417.08v7.625L5.0041 12.001A4.4256 4.4256 0 0 1 9.778 2.6405zm10.4252.1815a4.4256 4.4256 0 0 1 .5157 3.0248l-.1417-.08-6.6415-3.823-2.0911-1.205 3.0247-5.234a4.4256 4.4256 0 0 1 5.3339 7.3172zm4.3228 5.3217a4.4256 4.4256 0 0 1-2.3603 1.9848v-7.625l-2.0916-1.205-2.8851 4.9975 4.8256 2.7668v12.193a4.4256 4.4256 0 0 1 2.5114-13.1121z"/></svg>`,
+  anthropic: `<svg width="1em" height="1em" viewBox="0 0 24 24" fill="currentColor"><path d="M17.5 3L11.8 13.3L8 6H6.1L10.8 14.5L9.6 16.7L1.8 2.6H0L8.7 18.2L9.6 19.8L20 1H17.5M16.9 11.2L12.7 18.8H18L22.2 11.2H16.9Z"/></svg>`,
+  google: `<svg width="1em" height="1em" viewBox="0 0 24 24" fill="currentColor"><path d="M12.48 10.92v3.28h7.84c-.24 1.84-.853 3.187-1.787 4.133-1.147 1.147-2.933 2.4-6.053 2.4-4.827 0-8.6-3.893-8.6-8.72s3.773-8.72 8.6-8.72c2.6 0 4.507 1.027 5.907 2.347l2.307-2.307C18.747 1.44 16.133 0 12.48 0 5.867 0 .307 5.387.307 12s5.56 12 12.173 12c3.573 0 6.267-1.173 8.373-3.36 2.16-2.16 2.84-5.213 2.84-7.667 0-.76-.053-1.467-.173-2.053H12.48z"/></svg>`
+};
+
+const PROVIDER_BRANDS = {
+  openai: { color: DEFAULT_BRAND_COLOR, isSvg: true, icon: SVG_ICONS.openai, name: "OpenAI" },
+  anthropic: { color: DEFAULT_BRAND_COLOR, isSvg: true, icon: SVG_ICONS.anthropic, name: "Anthropic" },
+  google: { color: DEFAULT_BRAND_COLOR, isSvg: true, icon: SVG_ICONS.google, name: "Google" },
+  gemini: { color: DEFAULT_BRAND_COLOR, isSvg: true, icon: SVG_ICONS.google, name: "Gemini" },
+  deepseek: { color: DEFAULT_BRAND_COLOR, isSvg: false, icon: "fa-solid fa-wave-square", name: "DeepSeek" },
+  openrouter: { color: DEFAULT_BRAND_COLOR, isSvg: false, icon: "fa-solid fa-route", name: "OpenRouter" },
+  qwen: { color: DEFAULT_BRAND_COLOR, isSvg: false, icon: "fa-solid fa-brain", name: "Qwen" },
+  ollama: { color: DEFAULT_BRAND_COLOR, isSvg: false, icon: "fa-brands fa-kickstarter-k", name: "Ollama" },
+  siliconflow: { color: DEFAULT_BRAND_COLOR, isSvg: false, icon: "fa-solid fa-microchip", name: "SiliconFlow" },
+  custom: { color: DEFAULT_BRAND_COLOR, isSvg: false, icon: "fa-solid fa-server", name: "提供商" }
+};
+
+function getProviderBrand(key, rawType) {
+  const typeKey = (rawType || "").toLowerCase();
+  const k = (key || "").toLowerCase();
+
+  // 1. 优先尝试直接名称包含的品牌匹配（因为 key 通常是用户的命名，具有直接指导意义）
+  for (const [brandKey, bObj] of Object.entries(PROVIDER_BRANDS)) {
+    if (brandKey !== 'custom' && k.includes(brandKey)) {
+      return { ...bObj };
+    }
+  }
+
+  // 2. 如果名称没匹配上，再看他的底层驱动引擎是否为已知的官方大厂（但必须排除 openai，因为许多第三方 API 中转站也用 openai 类型）
+  if (typeKey && typeKey !== 'openai' && PROVIDER_BRANDS[typeKey]) {
+    return { ...PROVIDER_BRANDS[typeKey] };
+  }
+
+  // 完全抹去自定义商和 newapi 的越权显示，全面统一为默认的黑灰金质感 + `fa-server` 图标
+  return { ...PROVIDER_BRANDS.custom };
+}
+
+function normalizeProviderModels(modelsValue, ensureOne = true) {
+  const rows = [];
+
+  if (Array.isArray(modelsValue)) {
+    for (const item of modelsValue) {
+      rows.push(normalizeProviderModelRow(item));
+    }
+  } else if (modelsValue && typeof modelsValue === "object") {
+    for (const [key, value] of Object.entries(modelsValue)) {
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const objectValue = cloneProviderConfig(value);
+        if (!objectValue.id && !objectValue.model) objectValue.id = key;
+        rows.push(normalizeProviderModelRow(objectValue, key));
+      } else {
+        rows.push(normalizeProviderModelRow(key, key));
+      }
+    }
+  }
+
+  if (ensureOne && rows.length === 0) rows.push(normalizeProviderModelRow(""));
+  return rows;
+}
+
+function providerModelRowTemplate(rowData = {}) {
+  const row = {
+    id: rowData.id || "",
+    contextWindow: rowData.contextWindow || "",
+    reasoning: rowData.reasoning === true,
+    input: rowData.input || "",
+    extras: rowData.extras && typeof rowData.extras === "object" && !Array.isArray(rowData.extras) ? rowData.extras : {}
+  };
+
+  return `
+    <div class="provider-model-row" data-provider-model-row>
+      <input type="text" class="provider-model-id" placeholder="模型 ID（如 gpt-4o-mini）" value="${escapeHtml(row.id)}" />
+      <input type="number" min="1" step="1" class="provider-model-context" placeholder="上下文窗口" value="${escapeHtml(row.contextWindow)}" />
+      <label class="provider-model-reasoning">
+        <input type="checkbox" class="provider-model-reasoning-toggle" ${row.reasoning ? "checked" : ""} />
+        推理
+      </label>
+      <input type="text" class="provider-model-input" placeholder="输入类型（逗号分隔，可留空）" value="${escapeHtml(row.input)}" />
+      <input type="hidden" class="provider-model-extras" value="${escapeHtml(JSON.stringify(row.extras))}" />
+      <button type="button" class="provider-model-remove" data-provider-model-remove title="移除模型" aria-label="移除模型">
+        <i class="fa-solid fa-minus"></i>
+      </button>
+    </div>
+  `;
+}
+
+function providerCardTemplate(providerKey = "", provider = {}, originalKey = "") {
+  const info = normalizeProviderEditorData(provider);
+  const apiTypeOptions = ["openai", "anthropic", "azure-openai", "gemini", "custom"];
+  if (info.apiType && !apiTypeOptions.includes(info.apiType)) {
+    apiTypeOptions.unshift(info.apiType);
+  }
+  const optionsHtml = apiTypeOptions
+    .map((type) => `<option value="${type}"${type === info.apiType ? " selected" : ""}>${type}</option>`)
+    .join("");
+  const modelRowsHtml = info.modelRows.map((row) => providerModelRowTemplate(row)).join("");
+
+  // 提取提供商级别的额外 JSON 配置（如 temperature, 等等）
+  const providerExtraInfo = cloneProviderConfig(provider);
+  delete providerExtraInfo.baseUrl;
+  delete providerExtraInfo.baseURL;
+  delete providerExtraInfo.url;
+  delete providerExtraInfo.apiKey;
+  delete providerExtraInfo.apiType;
+  delete providerExtraInfo.type;
+  delete providerExtraInfo.models;
+
+  const initialJsonStr = Object.keys(providerExtraInfo).length > 0 ? JSON.stringify(providerExtraInfo, null, 2) : "";
+
+  const brand = getProviderBrand(providerKey, info.apiType);
+  const iconHTML = brand.isSvg ? brand.icon : `<i class="${brand.icon}"></i>`;
+
+  return `
+    <article class="provider-edit-card" data-provider-card data-original-key="${escapeHtml(originalKey)}">
+      <div class="provider-card-head" style="margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between;">
+        <div class="provider-card-title"><span style="display:inline-flex; width:22px; height:22px; justify-content:center; align-items:center; margin-right:8px; color:var(--accent);">${iconHTML}</span><span style="font-weight:600;">Provider 配置块</span></div>
+        <button type="button" class="provider-card-remove panel-action-btn" data-provider-remove title="删除 Provider" aria-label="删除 Provider" style="border-color: rgba(239, 68, 68, 0.3); color: #ef4444;">
+          <i class="fa-regular fa-trash-can"></i> 删除
+        </button>
+      </div>
+      <div class="provider-card-grid skeuo-input-group" style="gap:16px;">
+        <div class="config-row" style="margin:0;">
+          <label>Provider Key (唯一标识)</label>
+          <input type="text" class="provider-key skeuo-input" placeholder="如 openrouter" value="${escapeHtml(providerKey)}" />
+        </div>
+
+        <div class="config-row" style="margin:0;">
+          <label>Base URL</label>
+          <input type="text" class="provider-base-url skeuo-input" placeholder="https://openrouter.ai/api/v1 (可为空)" value="${escapeHtml(info.baseUrl)}" />
+        </div>
+
+        <div class="config-row" style="margin:0;">
+          <label>API Key</label>
+          <div class="provider-secret-wrap" style="position:relative; width: 100%;">
+            <input type="password" class="provider-api-key skeuo-input" placeholder="sk-..." autocomplete="off" value="${escapeHtml(info.apiKey)}" style="padding-right: 40px;" />
+            <button type="button" class="provider-secret-toggle" data-secret-toggle aria-label="显示 API Key" title="显示 API Key" style="position:absolute; right:10px; top:50%; transform:translateY(-50%); background:none; border:none; color:var(--text-muted); cursor:pointer;">
+              <i class="fa-regular fa-eye"></i>
+            </button>
+          </div>
+        </div>
+
+        <div class="config-row" style="margin:0;">
+          <label>API Type</label>
+          <select class="provider-api-type skeuo-input">${optionsHtml}</select>
+        </div>
+        
+        <div class="config-row" style="margin: 8px 0;">
+          <label>包含的模型列表</label>
+          <div class="provider-model-list" style="display:flex; flex-direction:column; gap:8px;">${modelRowsHtml}</div>
+          <button type="button" class="provider-model-add panel-action-btn" data-provider-model-add style="margin-top: 10px; border-style: dashed; width: 100%;">
+            <i class="fa-solid fa-plus"></i> 追加一个模型
+          </button>
+        </div>
+
+        <div class="config-row provider-json-row" style="margin: 12px 0 0 0;">
+          <label style="display:flex; justify-content:space-between;">
+            <span>提供商级高级覆盖 (JSON)</span>
+            <span class="provider-json-error json-error-text" style="display:none;"><i class="fa-solid fa-triangle-exclamation"></i> 格式异常</span>
+          </label>
+          <textarea class="provider-json-config skeuo-textarea" placeholder="{\n  &quot;temperature&quot;: 0.7,\n  &quot;top_p&quot;: 1\n}">${escapeHtml(initialJsonStr)}</textarea>
+          <small class="form-hint" style="margin-top:6px;">将应用于此 Provider 下属所有模型的覆盖参数，必须为合法的 JSON 对象。</small>
+        </div>
+      </div>
+    </article>
+  `;
+}
+
+function appendProviderModelRow(targetList, rowData = {}) {
+  if (!targetList) return;
+  targetList.insertAdjacentHTML("beforeend", providerModelRowTemplate(rowData));
+}
+
+function providerCardHasContent(card) {
+  if (!card) return false;
+  const key = card.querySelector(".provider-key")?.value.trim() || "";
+  const baseUrl = card.querySelector(".provider-base-url")?.value.trim() || "";
+  const apiKey = card.querySelector(".provider-api-key")?.value.trim() || "";
+  if (key || baseUrl || apiKey) return true;
+
+  const rows = Array.from(card.querySelectorAll("[data-provider-model-row]"));
+  return rows.some((row) => {
+    const modelId = row.querySelector(".provider-model-id")?.value.trim() || "";
+    const contextWindow = row.querySelector(".provider-model-context")?.value.trim() || "";
+    const reasoning = row.querySelector(".provider-model-reasoning-toggle")?.checked === true;
+    const input = row.querySelector(".provider-model-input")?.value.trim() || "";
+    return Boolean(modelId || contextWindow || reasoning || input);
+  });
+}
+
+function appendProviderEditorCard() {
+  const container = $("models-providers-editor");
+  if (!container) return;
+
+  const cards = Array.from(container.querySelectorAll("[data-provider-card]"));
+  if (cards.length === 1 && !providerCardHasContent(cards[0])) {
+    cards[0].querySelector(".provider-key")?.focus();
+    return;
+  }
+
+  container.insertAdjacentHTML("beforeend", providerCardTemplate("", {}, ""));
+  const input = container.querySelector(".provider-edit-card:last-child .provider-key");
+  input?.focus();
+}
+
+function renderProviderEditors(providers) {
+  const container = $("models-providers-editor");
+  if (!container) return;
+
+  const entries = Object.entries(providers || {});
+  if (entries.length === 0) {
+    container.innerHTML = providerCardTemplate("", {}, "");
+    return;
+  }
+
+  container.innerHTML = entries
+    .map(([key, provider]) => providerCardTemplate(key, provider, key))
+    .join("");
+}
+
+function getProviderModelRows(provider) {
+  const rows = normalizeProviderModels(provider?.models, false);
+  return rows.filter((row) => row.id);
+}
+
+function getContextTier(contextWindow) {
+  const size = Number(contextWindow) || 0;
+  if (size >= 128000) return { tone: "xl", label: "Ultra" };
+  if (size >= 64000) return { tone: "lg", label: "Long" };
+  if (size >= 32000) return { tone: "md", label: "Wide" };
+  return { tone: "sm", label: "Fast" };
+}
+
+function renderProviderMatrix(providers) {
+  const matrix = $("models-provider-matrix");
+  if (!matrix) return;
+
+  const entries = Object.entries(providers || {});
+  if (entries.length === 0) {
+    matrix.innerHTML = `
+      <div class="empty-placeholder" style="grid-column: 1 / -1; padding: 40px;">
+        <i class="fa-solid fa-plug-circle-xmark empty-icon"></i>
+        <h3 style="color:var(--text-primary); font-size:1.1rem;">还没有接入任何算力核心</h3>
+        <p>点击上方按钮接入第一个大模型提供商</p>
+      </div>
+    `;
+    return;
+  }
+
+  const cards = entries
+    .map(([key, provider]) => {
+      const rows = getProviderModelRows(provider);
+      const modelCount = rows.length;
+
+      const apiType =
+        (typeof provider?.apiType === "string" && provider.apiType) ||
+        (typeof provider?.type === "string" && provider.type) ||
+        "openai";
+
+      const brand = getProviderBrand(key, apiType);
+
+      // 生成内部模型标签块（移除小圆点）
+      const modelChips = rows.map((r, i) => {
+        if (i >= 8) return ""; // 最多展示前8个，防撑爆
+        return `<span class="model-chip">${escapeHtml(r.id)}</span>`;
+      }).join('');
+
+      const overCount = modelCount > 8 ? `<span class="model-chip" style="background: rgba(255,255,255,0.05);">+${modelCount - 8}</span>` : "";
+
+      const iconHTML = brand.isSvg ? brand.icon : `<i class="${brand.icon}"></i>`;
+
+      return `
+        <article class="provider-card" data-provider-key="${escapeHtml(key)}">
+          <div class="provider-header">
+            <div class="provider-brand">
+              <div class="provider-logo-btn" data-provider-card-manage data-provider-key="${escapeHtml(key)}" title="修改 ${escapeHtml(key)} 设置">
+                ${iconHTML}
+              </div>
+              <div class="provider-info">
+                <h4>${escapeHtml(key)}</h4>
+                <div class="provider-status active"><i class="fa-solid fa-circle"></i> 在线可用</div>
+              </div>
+            </div>
+            
+          </div>
+          <div class="model-chips-container" style="margin-top: auto; padding-top: 10px;">
+            ${modelChips}
+            ${overCount}
+            <span class="model-chip" data-provider-card-manage data-provider-key="${escapeHtml(key)}" style="background:none; border-style:dashed; cursor:pointer;" title="配置更多">
+              <i class="fa-solid fa-ellipsis"></i>
+            </span>
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+
+  matrix.innerHTML = cards;
+}
+
+// （底层模型胶囊池渲染已移除）
+
+function setProviderModalOpen(open) {
+  const modal = $("models-provider-modal");
+  if (!modal) return;
+
+  state.providerModalOpen = open;
+  modal.classList.toggle("open", open);
+  modal.setAttribute("aria-hidden", open ? "false" : "true");
+  document.body.classList.toggle("provider-modal-open", open);
+}
+
+function focusProviderEditorByKey(providerKey) {
+  if (!providerKey) return;
+  const cards = Array.from(document.querySelectorAll("#models-providers-editor [data-provider-card]"));
+  const target = cards.find((card) => {
+    const originalKey = card.getAttribute("data-original-key") || "";
+    const currentKey = card.querySelector(".provider-key")?.value.trim() || "";
+    return originalKey === providerKey || currentKey === providerKey;
+  });
+  if (!target) return;
+
+  target.classList.add("focus-ring");
+  setTimeout(() => target.classList.remove("focus-ring"), 900);
+  target.scrollIntoView({ behavior: "smooth", block: "center" });
+  target.querySelector(".provider-key")?.focus();
+}
+
+function openProviderModal({ appendNew = false, focusKey = "" } = {}) {
+  setProviderModalOpen(true);
+  if (appendNew) appendProviderEditorCard();
+  if (focusKey) {
+    requestAnimationFrame(() => focusProviderEditorByKey(focusKey));
+  }
+}
+
+function closeProviderModal() {
+  setProviderModalOpen(false);
+}
+
+function collectProviders() {
+  const container = $("models-providers-editor");
+  const cards = container ? Array.from(container.querySelectorAll("[data-provider-card]")) : [];
+  const providers = {};
+  const seenKeys = new Set();
+
+  // 用于拦截弹窗并显示错误的状态位
+  let hasError = false;
+
+  for (let i = 0; i < cards.length; i += 1) {
+    const card = cards[i];
+    const key = card.querySelector(".provider-key")?.value.trim() || "";
+    const baseUrl = card.querySelector(".provider-base-url")?.value.trim() || "";
+    const apiKey = card.querySelector(".provider-api-key")?.value.trim() || "";
+    const apiType = card.querySelector(".provider-api-type")?.value.trim() || "openai";
+    const jsonInput = card.querySelector(".provider-json-config");
+    const jsonErrorText = card.querySelector(".provider-json-error");
+
+    // 初始化错误提示类和文字隐现
+    if (jsonInput) jsonInput.classList.remove("json-error");
+    if (jsonErrorText) jsonErrorText.style.display = "none";
+
+    let extraConfig = {};
+    if (jsonInput && jsonInput.value.trim()) {
+      try {
+        extraConfig = JSON.parse(jsonInput.value);
+        if (typeof extraConfig !== "object" || Array.isArray(extraConfig)) {
+          throw new Error("Must be an object");
+        }
+      } catch (e) {
+        jsonInput.classList.add("json-error");
+        if (jsonErrorText) jsonErrorText.style.display = "flex";
+        hasError = true;
+        showToast(`Provider '${key}' 的高级 JSON 格式错误: ${e.message}`, "error");
+        continue;
+      }
+    }
+
+    const modelRows = Array.from(card.querySelectorAll("[data-provider-model-row]"));
+    const models = [];
+
+    for (let rowIndex = 0; rowIndex < modelRows.length; rowIndex += 1) {
+      const modelRow = modelRows[rowIndex];
+      const modelId = modelRow.querySelector(".provider-model-id")?.value.trim() || "";
+      const contextWindowRaw = modelRow.querySelector(".provider-model-context")?.value.trim() || "";
+      const reasoning = modelRow.querySelector(".provider-model-reasoning-toggle")?.checked === true;
+      const inputText = modelRow.querySelector(".provider-model-input")?.value.trim() || "";
+      const extrasRaw = modelRow.querySelector(".provider-model-extras")?.value || "{}";
+
+      if (!modelId && !contextWindowRaw && !reasoning && !inputText) continue;
+      if (!modelId) throw new Error(`Provider ${key || `#${i + 1}`} 的第 ${rowIndex + 1} 个模型缺少 ID`);
+
+      const inputValues = inputText
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
+
+      let contextWindow = null;
+      if (contextWindowRaw) {
+        const parsedWindow = Number(contextWindowRaw);
+        if (!Number.isInteger(parsedWindow) || parsedWindow <= 0) {
+          throw new Error(`Provider ${key || `#${i + 1}`} 的模型 ${modelId} 上下文窗口必须是正整数`);
+        }
+        contextWindow = parsedWindow;
+      }
+
+      let extras = {};
+      try {
+        const parsedExtras = JSON.parse(extrasRaw);
+        if (parsedExtras && typeof parsedExtras === "object" && !Array.isArray(parsedExtras)) {
+          extras = parsedExtras;
+        }
+      } catch {
+        extras = {};
+      }
+
+      delete extras.id;
+      delete extras.model;
+      delete extras.reasoning;
+      delete extras.contextWindow;
+      delete extras.input;
+
+      const useObjectShape = reasoning || contextWindow !== null || inputValues.length > 0 || Object.keys(extras).length > 0;
+      if (!useObjectShape) {
+        models.push(modelId);
+        continue;
+      }
+
+      const modelPayload = { ...extras, id: modelId };
+      if (reasoning) modelPayload.reasoning = true;
+      if (contextWindow !== null) modelPayload.contextWindow = contextWindow;
+      if (inputValues.length > 0) modelPayload.input = inputValues;
+      models.push(modelPayload);
+    }
+
+    if (!key && !baseUrl && !apiKey && models.length === 0) continue;
+    if (!key) {
+      showToast(`第 ${i + 1} 个 Provider 缺少 Key`, "error");
+      hasError = true;
+      continue;
+    }
+    if (seenKeys.has(key)) {
+      showToast(`Provider Key 重复：${key}`, "error");
+      hasError = true;
+      continue;
+    }
+    if (models.length === 0) {
+      showToast(`Provider ${key} 至少需要一个模型`, "error");
+      hasError = true;
+      continue;
+    }
+    seenKeys.add(key);
+
+    const originalKey = card.getAttribute("data-original-key") || "";
+    // 不再合并旧的 snapshot 以防 JSON 被抹除，完全按表单+JSON文本区数据定夺
+    const providerConfig = { ...extraConfig };
+
+    providerConfig.baseUrl = baseUrl;
+    providerConfig.apiKey = apiKey;
+    providerConfig.apiType = apiType || "openai";
+    providerConfig.models = models;
+    providers[key] = providerConfig;
+  }
+
+  if (hasError) throw new Error("JSON_Validation_Failed");
+
+  return providers;
+}
+
+// （模型选择器和绑定逻辑已移除）
+
+async function loadModels() {
+  try {
+    const data = await api("/api/models");
+    state.modelsHash = data.configHash;
+
+    const cfg = data.modelsConfig || {};
+    const providers = cfg.providers || {};
+    state.modelProviderSnapshots = {};
+    for (const [key, provider] of Object.entries(providers)) {
+      state.modelProviderSnapshots[key] = cloneProviderConfig(provider);
+    }
+
+    renderProviderEditors(providers);
+    renderProviderMatrix(providers);
+  } catch (err) {
+    showToast(err.message || String(err), "error");
+  }
+}
+
+async function saveModels() {
+  try {
+    const providers = collectProviders();
+
+    if (Object.keys(providers).length === 0) {
+      showToast("没有任何 Provider 数据！", "error");
+      return;
+    }
+
+    const payload = {
+      models: {
+        providers,
+        // 旧的字段如果不再渲染，可以为了向下兼容传 null 覆盖或直接保留，这里选择覆盖掉
+        default: null,
+        aliases: {}
+      },
+      baseHash: state.modelsHash
+    };
+
+    const btn = $("models-save");
+    if (btn) {
+      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 保存中...';
+      btn.disabled = true;
+    }
+
+    const result = await api("/api/models/save", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+
+    if (btn) {
+      btn.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> 保存并应用配置';
+      btn.disabled = false;
+    }
+
+    showToast("配置已成功保存并下发至 OpenClaw！", "success");
+    closeProviderModal();
+    await loadModels();
+  } catch (err) {
+    showToast(err.message || String(err), "error");
+  } finally {
+    const btn = $("models-save");
+    if (btn) {
+      btn.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> 保存并应用配置';
+      btn.disabled = false;
+    }
+  }
+}
+
+async function loadSkills() {
+  const target = $("skills-table");
+  target.innerHTML = renderSkeleton(6);
+  try {
+    const data = await api("/api/skills");
+    const skills = data.skills || [];
+    if (skills.length === 0) {
+      target.innerHTML = renderEmpty("fa-solid fa-box-open", "技能箱是空的", "还没有安装任何技能，快去添加一些吧！");
+      return;
+    }
+    const rows = skills
+      .slice()
+      .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+      .map((skill) => ({
+        name: skill.name,
+        description: skill.description?.trim() || "",
+        source: skill.source,
+        key: skill.skillKey,
+        enabled: !skill.disabled,
+        eligible: skill.eligible
+      }));
+
+    const html = renderTable(
+      [
+        {
+          title: "技能名称",
+          className: "col-w-sm",
+          render: (r) => `<div style="display:flex; flex-direction:column; gap:4px; text-align: left;">
+                            <strong style="font-size: 1rem; color: var(--text-primary); font-weight: 500;">${escapeHtml(r.name.replace(/\s*\(.*?\)/, ''))}</strong>
+                            <span style="font-size: 0.8rem; color: var(--text-muted); font-family: var(--font-mono); letter-spacing: 0.5px;">${escapeHtml(r.key)}</span>
+                          </div>`
+        },
+        {
+          title: "功能描述",
+          className: "col-w-lg",
+          render: (r) => `<div style="width: 100%; white-space: normal; line-height: 1.6; color: var(--text-secondary); font-size: 0.85rem; padding: 4px 0; text-align: left;">${escapeHtml(r.description || "-")}</div>`
+        },
+        {
+          title: "来源位置",
+          className: "col-w-sm",
+          align: "center",
+          render: (r) => `<span style="margin:0; display:inline-block; padding: 4px 10px; border-radius: 6px; font-size: 0.8rem; background: rgba(128, 128, 128, 0.1); border: 1px solid var(--glass-border); color: var(--text-secondary);">${escapeHtml(r.source)}</span>`
+        },
+        {
+          title: "启用状态",
+          align: "center",
+          render: (r) => `
+            <label class="switch-toggle" style="margin:0 auto; display:block;">
+              <input type="checkbox" data-skill-toggle="${escapeHtml(r.key)}" ${r.enabled ? "checked" : ""} />
+              <span class="slider">
+                <span class="knob"></span>
+              </span>
+            </label>`
+        },
+        {
+          title: "可用性",
+          align: "center",
+          render: (r) => `<span style="display:inline-block; padding: 4px 10px; border-radius: 6px; font-size: 0.8rem; font-weight: 500; ${r.eligible ? 'background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3);' : 'background: rgba(251, 191, 36, 0.15); color: var(--warning); border: 1px solid rgba(251, 191, 36, 0.3);'}">${r.eligible ? '就绪' : '未就绪'}</span>`
+        }
+      ],
+      rows
+    );
+
+    target.innerHTML = html;
+
+    for (const toggle of target.querySelectorAll("[data-skill-toggle]")) {
+      toggle.addEventListener("change", async () => {
+        const skillKey = toggle.getAttribute("data-skill-toggle");
+        const enabled = toggle.checked;
+        if (!skillKey) return;
+        try {
+          await api("/api/skills/update", {
+            method: "POST",
+            body: JSON.stringify({ skillKey, enabled })
+          });
+        } catch (err) {
+          alert(err.message);
+          toggle.checked = !enabled;
+        }
+      });
+    }
+  } catch (err) {
+    target.textContent = err.message;
+  }
+}
+
+function cronTemplate() {
+  return {
+    name: "MVP reminder",
+    schedule: {
+      kind: "at",
+      at: new Date(Date.now() + 30 * 60_000).toISOString()
+    },
+    payload: {
+      kind: "agentTurn",
+      message: "提醒：这是测试提醒任务。"
+    },
+    sessionTarget: "isolated",
+    enabled: true
+  };
+}
+
+async function loadCron() {
+  const target = $("cron-list");
+  const formWrap = $("cron-form-wrap");
+
+  // 完全隐藏表单，直到数据加载完毕再连同骨架屏一起展示
+  if (formWrap) {
+    formWrap.style.display = 'none';
+    formWrap.style.opacity = '0';
+  }
+
+  target.innerHTML = renderSkeleton(4);
+
+  if (!$("cron-job-json").value.trim()) {
+    $("cron-job-json").value = JSON.stringify(cronTemplate(), null, 2);
+  }
+
+  try {
+    const data = await api("/api/cron/list?includeDisabled=true");
+
+    // 数据拉取成功后，开始展示动画
+    if (formWrap) {
+      formWrap.style.display = 'block';
+      // 给一点极小的延迟让 display:block 渲染，从而触发 opacity 过渡
+      setTimeout(() => {
+        formWrap.style.transition = 'opacity 0.4s cubic-bezier(0.4, 0, 0.2, 1), transform 0.4s cubic-bezier(0.4, 0, 0.2, 1)';
+        formWrap.style.opacity = '1';
+        formWrap.style.transform = 'translateY(0)';
+      }, 50);
+    }
+    const jobs = data.jobs || [];
+    if (jobs.length === 0) {
+      target.innerHTML = renderEmpty("fa-solid fa-calendar-xmark", "暂无任务", "计划表里空荡荡的，点击下方模板创建一个？");
+      return;
+    }
+
+    const html = `<div class="dashboard-grid" style="gap: 16px;">` + jobs.map((r) => {
+      const sch = r.schedule || {};
+      let badge = '';
+      if (sch.kind === 'at') {
+        const timeStr = new Date(sch.at).toLocaleString();
+        badge = `<span style="color: #60a5fa; background: rgba(59, 112, 252, 0.15); padding: 4px 10px; border-radius: 6px; font-size: 0.8rem; border: 1px solid rgba(59, 112, 252, 0.3);"><i class="fa-regular fa-clock" style="margin-right:6px"></i>一次性: ${timeStr}</span>`;
+      } else if (sch.kind === 'cron') {
+        let expr = sch.human || sch.expr;
+        if (expr && expr.startsWith('在 ')) expr = expr.substring(2);
+        if (expr && expr.startsWith('在')) expr = expr.substring(1);
+        badge = `<span style="color: var(--success); background: rgba(16, 185, 129, 0.15); padding: 4px 10px; border-radius: 6px; font-size: 0.8rem; border: 1px solid rgba(16, 185, 129, 0.3);"><i class="fa-solid fa-rotate" style="margin-right:6px"></i>周期: ${escapeHtml(expr)}</span>`;
+      } else if (sch.kind === 'every') {
+        const ms = parseInt(sch.everyMs, 10);
+        const desc = ms >= 60000 ? `每 ${Math.round(ms / 60000)} 分钟` : `每 ${Math.round(ms / 1000)} 秒`;
+        badge = `<span style="color: var(--warning); background: rgba(251, 191, 36, 0.15); padding: 4px 10px; border-radius: 6px; font-size: 0.8rem; border: 1px solid rgba(251, 191, 36, 0.3);"><i class="fa-solid fa-stopwatch" style="margin-right:6px"></i>循环: ${desc}</span>`;
+      } else {
+        badge = `<code style="font-size: 0.8rem; color: var(--text-muted); padding: 4px 8px; border-radius: 6px; background: rgba(255,255,255,0.05)">${escapeHtml(JSON.stringify(sch))}</code>`;
+      }
+
+      const stateInfo = r.state || {};
+      let statusBadge = '<span style="color: var(--foreground-muted);">-</span>';
+      if (stateInfo.lastStatus === 'ok') {
+        statusBadge = '<span style="color: var(--success); font-weight: 500;"><i class="fa-solid fa-check-circle" style="margin-right:4px;"></i>运行成功</span>';
+      } else if (stateInfo.lastStatus === 'error') {
+        statusBadge = '<span style="color: var(--danger); font-weight: 500;"><i class="fa-solid fa-xmark-circle" style="margin-right:4px;"></i>运行失败</span>';
+      } else if (stateInfo.lastStatus) {
+        statusBadge = `<span>${escapeHtml(stateInfo.lastStatus)}</span>`;
+      }
+      const timeStr = stateInfo.lastRunAtMs ? `<div style="font-size: 0.8rem; color: var(--foreground-muted); margin-top: 4px;"><i class="fa-regular fa-clock" style="margin-right:4px;"></i>上次运行时间: ${new Date(stateInfo.lastRunAtMs).toLocaleString()}</div>` : "";
+
+      return `
+        <div class="glass-panel" data-spotlight style="padding: 20px; display: flex; flex-direction: column; gap: 16px; margin-bottom: 0;">
+          <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;">
+            <div style="display:flex; flex-direction:column; gap:4px; flex: 1;">
+              <strong style="font-size: 1.05rem; color: var(--foreground); font-weight: 600; letter-spacing: -0.01em;">${escapeHtml(r.name || "(unnamed)")}</strong>
+              <span style="font-size: 0.8rem; color: var(--foreground-muted); font-family: var(--font-mono);">${escapeHtml(r.id)}</span>
+            </div>
+            <label class="switch-toggle" style="margin-top: 2px;">
+              <input type="checkbox" data-cron-enabled="${escapeHtml(r.id)}" ${r.enabled ? "checked" : ""} />
+              <span class="slider"><span class="knob"></span></span>
+            </label>
+          </div>
+          
+          <div style="display: flex; flex-wrap: wrap; gap: 12px; align-items: center;">
+            ${badge}
+          </div>
+
+          <div style="background: rgba(255, 255, 255, 0.02); border-radius: 8px; padding: 12px; border: 1px solid var(--border-default);">
+            <div style="font-size: 0.85rem;">${statusBadge}</div>
+            ${timeStr}
+          </div>
+          
+          <div style="display: flex; gap: 8px; margin-top: auto; padding-top: 8px;">
+            <button data-cron-run="${escapeHtml(r.id)}" class="action-btn play-btn" style="flex: 1; justify-content: center; background: rgba(59, 112, 252, 0.15); color: #82b0ff; border-color: rgba(59, 112, 252, 0.3);" title="立即执行"><i class="fa-solid fa-play" style="margin-right: 6px;"></i>执行</button>
+            <button data-cron-runs="${escapeHtml(r.id)}" class="action-btn log-btn" style="flex: 1; justify-content: center;" title="运行日志"><i class="fa-solid fa-clock-rotate-left" style="margin-right: 6px;"></i>日志</button>
+            <button data-cron-remove="${escapeHtml(r.id)}" class="action-btn del-btn" style="flex: 1; justify-content: center;" title="删除任务"><i class="fa-solid fa-trash-can" style="margin-right: 6px;"></i>删除</button>
+          </div>
+        </div>
+      `;
+    }).join("") + `</div>`;
+
+    target.innerHTML = html;
+
+    for (const checkbox of target.querySelectorAll("[data-cron-enabled]")) {
+      checkbox.addEventListener("change", async () => {
+        const jobId = checkbox.getAttribute("data-cron-enabled");
+        const enabled = checkbox.checked;
+        if (!jobId) return;
+        try {
+          await api("/api/cron/update", {
+            method: "POST",
+            body: JSON.stringify({ jobId, patch: { enabled } })
+          });
+        } catch (err) {
+          alert(err.message);
+          checkbox.checked = !enabled;
+        }
+      });
+    }
+
+    for (const btn of target.querySelectorAll("[data-cron-run]")) {
+      btn.addEventListener("click", async () => {
+        const jobId = btn.getAttribute("data-cron-run");
+        if (!jobId) return;
+        try {
+          await api("/api/cron/run", { method: "POST", body: JSON.stringify({ jobId }) });
+          await loadCron();
+        } catch (err) {
+          alert(err.message);
+        }
+      });
+    }
+
+    for (const btn of target.querySelectorAll("[data-cron-runs]")) {
+      btn.addEventListener("click", async () => {
+        const jobId = btn.getAttribute("data-cron-runs");
+        if (!jobId) return;
+        try {
+          const runs = await api(`/api/cron/runs?jobId=${encodeURIComponent(jobId)}`);
+          const el = $("cron-result");
+          el.textContent = JSON.stringify(runs, null, 2);
+          el.style.display = "block";
+        } catch (err) {
+          const el = $("cron-result");
+          el.style.display = "block";
+          showError("cron-result", err);
+        }
+      });
+    }
+
+    for (const btn of target.querySelectorAll("[data-cron-remove]")) {
+      btn.addEventListener("click", async () => {
+        const jobId = btn.getAttribute("data-cron-remove");
+        if (!jobId) return;
+        if (!confirm(`Remove job ${jobId}?`)) return;
+        try {
+          await api("/api/cron/remove", { method: "POST", body: JSON.stringify({ jobId }) });
+          await loadCron();
+        } catch (err) {
+          alert(err.message);
+        }
+      });
+    }
+  } catch (err) {
+    target.textContent = err.message;
+  }
+}
+
+async function addCronJob() {
+  try {
+    let job;
+
+    if (state.cronJsonMode) {
+      const rawVal = $("cron-job-json").value.trim();
+      if (!rawVal) {
+        showToast("任务配置内容不能为空！", "error");
+        return;
+      }
+      try {
+        job = JSON.parse(rawVal);
+      } catch (e) {
+        showToast("JSON 格式错误，请检查语法！", "error");
+        return;
+      }
+    } else {
+      // Form builder mode
+      const name = $("cron-form-name").value.trim();
+      const kind = $("cron-form-kind").value;
+      const value = $("cron-form-value").value.trim();
+      const message = $("cron-form-message").value.trim();
+
+      if (kind !== "cron" && !value) {
+        showToast("请填写计划触发规则！", "error");
+        return;
+      }
+      if (!message) {
+        showToast("请填写任务指令 (Prompt)！", "error");
+        return;
+      }
+
+      const schedule = { kind };
+      if (kind === "cron") {
+        const timeVal = $("cron-form-time").value; // e.g. "08:30"
+        if (!timeVal) {
+          showToast("请选择每天执行的时间！", "error");
+          return;
+        }
+        const [hh, mm] = timeVal.split(":");
+        // 拼接成标准 cron 表达式 (分 时 * * *)
+        schedule.expr = `${parseInt(mm, 10)} ${parseInt(hh, 10)} * * *`;
+        schedule.tz = "Asia/Shanghai"; // 给默认时区保证时间准确
+      } else if (kind === "at") {
+        let parsedAt = value;
+        // 如果是 datetime-local 选出来的值 (YYYY-MM-DDThh:mm)
+        if (value.length === 16 && value.includes('T')) {
+          parsedAt = new Date(value).toISOString();
+        }
+        schedule.at = parsedAt;
+      } else if (kind === "every") {
+        // Evaluate user input safely (e.g. they might type "30 * 60000" or just "1800000")
+        let parsedMs = 0;
+        try {
+          parsedMs = evaluateArithmetic(value);
+        } catch (e) {
+          parsedMs = parseInt(value, 10);
+        }
+        if (!Number.isFinite(parsedMs) || parsedMs <= 0) {
+          showToast("间隔时间格式无效，请输入大于 0 的毫秒值或算式。", "error");
+          return;
+        }
+        schedule.everyMs = Math.round(parsedMs);
+      }
+
+      job = {
+        name: name || "Untitled Task",
+        schedule,
+        payload: {
+          kind: "agentTurn",
+          message
+        },
+        sessionTarget: $("cron-form-isolated").checked ? "isolated" : "main",
+        enabled: $("cron-form-enabled").checked
+      };
+    }
+
+    const btn = $("cron-add");
+    if (btn) {
+      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 创建中...';
+      btn.disabled = true;
+    }
+
+    const result = await api("/api/cron/add", {
+      method: "POST",
+      body: JSON.stringify({ job })
+    });
+
+    if (btn) {
+      btn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> 下发创建任务';
+      btn.disabled = false;
+    }
+
+    showToast("任务创建成功！", "success");
+    $("cron-job-json").value = ""; // 清空输入框
+    await loadCron();
+  } catch (err) {
+    const btn = $("cron-add");
+    if (btn) {
+      btn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> 下发创建任务';
+      btn.disabled = false;
+    }
+    showToast(err.message || String(err), "error");
+  }
+}
+
+function updateNodeCommandOptions(commands) {
+  const normalized = Array.from(new Set((commands || []).map((item) => String(item).trim()).filter(Boolean)));
+  state.nodeCommandDefaults = normalized;
+  const list = $("node-command-options");
+  if (list) {
+    list.innerHTML = normalized.map((cmd) => `<option value="${escapeHtml(cmd)}"></option>`).join("");
+  }
+  const commandInput = $("node-command");
+  if (commandInput && normalized.length > 0) {
+    const current = commandInput.value.trim();
+    if (!current || !normalized.includes(current)) {
+      commandInput.value = normalized[0];
+    }
+  }
+}
+
+function selectNode(nodeId, commands) {
+  const id = String(nodeId || "").trim();
+  if (!id) return;
+  const nodeInput = $("node-id");
+  if (nodeInput) nodeInput.value = id;
+  updateNodeCommandOptions(commands);
+  for (const row of document.querySelectorAll("#nodes-list tbody tr")) {
+    row.classList.toggle("node-row-selected", row.getAttribute("data-node-id") === id);
+  }
+}
+
+async function loadNodes() {
+  const target = $("nodes-list");
+
+  target.innerHTML = renderSkeleton(3);
+  try {
+    const data = await api("/api/nodes");
+    const nodes = data.nodes || [];
+    if (nodes.length === 0) {
+      target.innerHTML = renderEmpty("fa-solid fa-network-wired", "未发现节点", "当前的什亭之箱还没有连接任何外部节点～");
+      updateNodeCommandOptions([]);
+      return;
+    }
+    const rows = nodes.map((node) => ({
+      ...node,
+      commandList: Array.isArray(node.commands) ? node.commands : [],
+      caps: (node.caps || []).join(", "),
+      commands: (node.commands || []).join(", ")
+    }));
+    const commandMap = new Map(rows.map((row) => [String(row.nodeId || ""), row.commandList]));
+
+    const html = `<div class="dashboard-grid" style="gap: 16px;">` + rows.map((r) => {
+      const statusClass = r.connected ? 'ok' : 'warn';
+      const statusText = r.connected ? '在线' : '离线';
+      const statusColor = r.connected ? 'var(--success)' : 'var(--warning)';
+      const statusBg = r.connected ? 'rgba(16, 185, 129, 0.15)' : 'rgba(251, 191, 36, 0.15)';
+      const statusBorder = r.connected ? 'rgba(16, 185, 129, 0.3)' : 'rgba(251, 191, 36, 0.3)';
+
+      return `
+        <div class="glass-panel node-row" data-node-id="${escapeHtml(r.nodeId)}" data-spotlight style="padding: 20px; display: flex; flex-direction: column; gap: 16px; margin-bottom: 0; cursor: pointer;">
+          
+          <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;">
+            <div style="display:flex; flex-direction:column; gap:4px; flex: 1;">
+              <strong style="font-size: 1.05rem; color: var(--foreground); font-weight: 600; letter-spacing: -0.01em;">${escapeHtml(r.displayName || r.nodeId)}</strong>
+              <span style="font-size: 0.8rem; color: var(--foreground-muted); font-family: var(--font-mono);">${escapeHtml(r.nodeId)}</span>
+            </div>
+            <span style="color: ${statusColor}; background: ${statusBg}; border: 1px solid ${statusBorder}; padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
+               <i class="${r.connected ? 'fa-solid fa-link' : 'fa-solid fa-link-slash'}" style="margin-right:4px;"></i>${statusText}
+            </span>
+          </div>
+          
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; background: rgba(255, 255, 255, 0.02); border-radius: 8px; padding: 12px; border: 1px solid var(--border-default);">
+            <div style="display: flex; flex-direction: column; gap: 4px;">
+              <span style="font-size: 0.75rem; color: var(--foreground-muted);">运行平台</span>
+              <span style="font-size: 0.85rem; color: var(--foreground); font-family: var(--font-mono);">${escapeHtml(r.platform || "-")}</span>
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 4px;">
+              <span style="font-size: 0.75rem; color: var(--foreground-muted);">远程 IP</span>
+              <span style="font-size: 0.85rem; color: var(--foreground); font-family: var(--font-mono);">${escapeHtml(r.remoteIp || "-")}</span>
+            </div>
+            <div style="grid-column: 1 / -1; display: flex; flex-direction: column; gap: 4px;">
+              <span style="font-size: 0.75rem; color: var(--foreground-muted);">能力 (Caps)</span>
+              <span style="font-size: 0.82rem; color: var(--foreground-subtle);">${escapeHtml(r.caps || "-")}</span>
+            </div>
+          </div>
+          
+          <div style="display: flex; justify-content: flex-end; margin-top: auto; padding-top: 8px;">
+            <button type="button" class="action-btn log-btn" data-node-describe="${escapeHtml(r.nodeId)}" title="详情信息" style="padding: 6px 12px; border-radius: 6px;">
+               <i class="fa-solid fa-circle-info" style="margin-right: 6px;"></i>详细节点信息
+            </button>
+          </div>
+        </div>
+      `;
+    }).join("") + `</div>`;
+
+    target.innerHTML = html;
+
+    const tableRows = Array.from(target.querySelectorAll(".node-row"));
+    for (const row of tableRows) {
+      const rowNodeId = row.getAttribute("data-node-id");
+      if (!rowNodeId) continue;
+      row.addEventListener("click", (event) => {
+        if (event.target.closest("[data-node-describe]")) return;
+        selectNode(rowNodeId, commandMap.get(rowNodeId) || []);
+      });
+    }
+
+    for (const btn of target.querySelectorAll("[data-node-describe]")) {
+      btn.addEventListener("click", async () => {
+        const nodeId = btn.getAttribute("data-node-describe");
+        if (!nodeId) return;
+        selectNode(nodeId, commandMap.get(nodeId) || []);
+        try {
+          const result = await api(`/api/nodes/describe?nodeId=${encodeURIComponent(nodeId)}`);
+          $("node-result").textContent = JSON.stringify(result, null, 2);
+        } catch (err) {
+          showError("node-result", err);
+        }
+      });
+    }
+  } catch (err) {
+    target.textContent = err.message;
+  }
+}
+
+async function invokeNodeCommand() {
+  try {
+    const nodeId = $("node-id").value.trim();
+    const command = $("node-command").value.trim();
+    const params = JSON.parse($("node-params").value || "{}");
+    if (!nodeId || !command) throw new Error("nodeId and command are required");
+
+    const result = await api("/api/nodes/invoke", {
+      method: "POST",
+      body: JSON.stringify({ nodeId, command, params, timeoutMs: 15000 })
+    });
+    $("node-result").textContent = JSON.stringify(result, null, 2);
+  } catch (err) {
+    showError("node-result", err);
+  }
+}
+
+function normalizeLogLine(line) {
+  const raw = String(line || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed === "string") return parsed;
+    if (parsed && typeof parsed === "object") {
+      if (typeof parsed[0] === "string" || typeof parsed[1] === "string") {
+        return [parsed[0], parsed[1]].filter(Boolean).join(" ");
+      }
+      if (typeof parsed.message === "string") return parsed.message;
+      return JSON.stringify(parsed);
+    }
+  } catch {
+    return raw;
+  }
+  return raw;
+}
+
+async function pullLogs() {
+  try {
+    const params = new URLSearchParams();
+    if (state.logsCursor !== null) params.set("cursor", String(state.logsCursor));
+    params.set("limit", "200");
+    const data = await api(`/api/logs?${params.toString()}`);
+
+    state.logsCursor = data.cursor;
+    const keywordRaw = $("logs-keyword").value.trim();
+    const keyword = keywordRaw.toLowerCase();
+    const lines = (data.lines || []).map(normalizeLogLine).filter(Boolean);
+    const filtered = keyword ? lines.filter((line) => line.toLowerCase().includes(keyword)) : lines;
+
+    appendLogLines(filtered, keywordRaw);
+  } catch (err) {
+    const keywordRaw = $("logs-keyword")?.value.trim() || "";
+    appendLogLines([`[error] ${err.message}`], keywordRaw);
+  }
+}
+
+function startLogStream() {
+  if (state.logsLive) return;
+  state.logsLive = true;
+  $("logs-toggle").textContent = "暂停实时";
+  pullLogs();
+  state.logsTimer = setInterval(pullLogs, 2000);
+}
+
+function stopLogStream() {
+  state.logsLive = false;
+  $("logs-toggle").textContent = "开始实时";
+  if (state.logsTimer) {
+    clearInterval(state.logsTimer);
+    state.logsTimer = null;
+  }
+}
+
+function initLogsView() {
+  if (!$("logs-output").dataset.bound) {
+    $("logs-output").dataset.bound = "1";
+    $("logs-toggle").addEventListener("click", () => {
+      if (state.logsLive) stopLogStream();
+      else startLogStream();
+    });
+
+    $("logs-clear").addEventListener("click", () => {
+      state.logsCursor = null;
+      $("logs-output").innerHTML = "";
+    });
+
+    $("logs-keyword").addEventListener("input", () => {
+      $("logs-output").innerHTML = "";
+      state.logsCursor = null;
+      pullLogs();
+    });
+  }
+}
+
+function logoutBasicAuth() {
+  localStorage.removeItem("openclaw_token");
+  window.location.href = "/login.html";
+}
+
